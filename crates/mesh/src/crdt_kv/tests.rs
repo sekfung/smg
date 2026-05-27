@@ -646,6 +646,137 @@ fn test_epoch_max_wins_older_delayed_remove_preserves_tombstone_age() {
 }
 
 #[test]
+fn test_epoch_max_wins_newer_tombstone_refreshes_tombstone_age() {
+    // Symmetric to the older-delayed-remove case: when a *newer* winning
+    // tombstone supersedes the existing one, the GC clock must reset. If the
+    // clock kept the original tombstone's `created_at`, GC could collect the
+    // entry immediately after the newer tombstone arrived, deleting state
+    // that a later delayed insert (older than the winning tombstone but
+    // newer than any remaining local frontier) would then resurrect.
+    init_test_logging();
+    let replica = CrdtOrMap::new();
+    replica.register_merge_strategy("rl:".to_string(), MergeStrategy::EpochMaxWins);
+
+    let key = "rl:global:node-a";
+
+    // Live insert at ts=10, then Remove at ts=50. The key is tombstoned with
+    // the (50, _) tombstone as the winning version.
+    let mut initial = OperationLog::new();
+    initial.append(Operation::insert(
+        key.to_string(),
+        encode(1, 1).to_vec(),
+        10,
+        ReplicaId::new(),
+    ));
+    initial.append(Operation::remove(key.to_string(), 50, ReplicaId::new()));
+    replica.merge(&initial);
+    assert!(replica.get(key).is_none(), "key fully tombstoned");
+
+    // Let the first tombstone age past the grace window we will use below.
+    // The grace value below also bounds how much wall-clock can elapse
+    // between the merge of `newer` and the GC check before the assertion
+    // becomes flaky, so keep this sleep / grace gap wide.
+    thread::sleep(Duration::from_millis(250));
+
+    // Newer winning Remove arrives at ts=200. The merged tombstone version
+    // advances; the GC clock must restart so the new winning tombstone gets
+    // its full grace period.
+    let mut newer = OperationLog::new();
+    newer.append(Operation::remove(key.to_string(), 200, ReplicaId::new()));
+    replica.merge(&newer);
+
+    // Grace is longer than the time since the newer tombstone but shorter
+    // than the time since the original tombstone. Without the refresh, GC
+    // would collect immediately; with it, GC must keep the entry. 150ms
+    // gives ample headroom against CI scheduler stalls between the merge
+    // and the GC call (which has to land inside grace for the assertion
+    // to be meaningful).
+    let removed = replica.gc_tombstones_with_grace(Duration::from_millis(150));
+    assert_eq!(
+        removed, 0,
+        "newer winning tombstone must refresh the GC clock",
+    );
+}
+
+#[test]
+fn test_epoch_max_wins_put_returns_none_for_per_point_update() {
+    // A second insert on the same `rl:` key merges into the existing shard's
+    // live-points frontier; there is no clean "previously displaced" value.
+    // The trait contract for that case is `None`.
+    init_test_logging();
+    let replica = CrdtOrMap::new();
+    replica.register_merge_strategy("rl:".to_string(), MergeStrategy::EpochMaxWins);
+
+    let key = "rl:global:node-a".to_string();
+    assert_eq!(
+        replica.insert(key.clone(), encode(1, 5).to_vec()),
+        None,
+        "first insert on a vacant key has no previous",
+    );
+    assert_eq!(
+        replica.insert(key.clone(), encode(1, 7).to_vec()),
+        None,
+        "per-point update on existing live shard has no well-defined previous",
+    );
+}
+
+#[test]
+fn test_epoch_max_wins_put_malformed_returns_current_live_bytes() {
+    // Malformed payload is rejected; the trait says return current live bytes
+    // so the caller can see what is actually live without a second `get`.
+    init_test_logging();
+    let replica = CrdtOrMap::new();
+    replica.register_merge_strategy("rl:".to_string(), MergeStrategy::EpochMaxWins);
+
+    let key = "rl:global:node-a".to_string();
+    replica.insert(key.clone(), encode(1, 5).to_vec());
+    let live = replica.get(&key).expect("key is live after insert");
+
+    let result = replica.insert(key.clone(), vec![0xFF, 0xFF, 0xFF]);
+    assert_eq!(
+        result,
+        Some(live),
+        "malformed put returns current live bytes",
+    );
+}
+
+#[test]
+fn test_epoch_max_wins_delete_returns_prior_live_when_killing_key() {
+    // When a delete kills the last live points, the trait says return the
+    // prior live bytes. EpochMaxWins kills the live frontier when the
+    // tombstone version dominates every live point's version.
+    init_test_logging();
+    let replica = CrdtOrMap::new();
+    replica.register_merge_strategy("rl:".to_string(), MergeStrategy::EpochMaxWins);
+
+    let key = "rl:global:node-a".to_string();
+    replica.insert(key.clone(), encode(1, 5).to_vec());
+    let live = replica.get(&key).expect("key is live after insert");
+
+    // Local `remove` ticks the local clock past the insert's version, so the
+    // tombstone dominates the live frontier and the entry transitions Live
+    // -> Tombstone.
+    let removed = replica.remove(&key);
+    assert_eq!(
+        removed,
+        Some(live),
+        "delete that kills the last live points returns prior live bytes",
+    );
+    assert!(replica.get(&key).is_none(), "key is no longer live");
+}
+
+#[test]
+fn test_epoch_max_wins_delete_returns_none_for_never_seen_key() {
+    // A delete that arrives at a vacant key did not "remove an existing
+    // value"; the trait returns `None`.
+    init_test_logging();
+    let replica = CrdtOrMap::new();
+    replica.register_merge_strategy("rl:".to_string(), MergeStrategy::EpochMaxWins);
+
+    assert_eq!(replica.remove("rl:global:node-a"), None);
+}
+
+#[test]
 fn test_lww_remove_for_never_seen_key_blocks_delayed_insert() {
     // Same gap exists for LWW: a tombstone for a never-seen key must record
     // metadata so a delayed older insert cannot win by LWW comparison.
