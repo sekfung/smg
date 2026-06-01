@@ -56,7 +56,8 @@ use super::{
 use crate::{
     metrics,
     transport::{
-        limits::{MAX_MESSAGE_SIZE, STREAM_IDLE_TIMEOUT},
+        crdt_batch::{build_crdt_batches, dispatch_crdt_batch, wrap_crdt_batch},
+        limits::{MAX_MESSAGE_SIZE, MAX_STREAM_CHUNK_BYTES, STREAM_IDLE_TIMEOUT},
         sync_stream::{
             build_heartbeat, build_peer_stream_batches, dispatch_stream_batch, wrap_stream_batch,
         },
@@ -515,6 +516,38 @@ impl GossipController {
                                         }
                                     }
                                 }
+
+                                // CRDT op-log: broadcast the full snapshot for
+                                // this round, split into frames that stay under
+                                // the gRPC message cap. Merge is idempotent by
+                                // op-id so re-sending seen ops is a no-op.
+                                for crdt_batch in build_crdt_batches(
+                                    &stream_batch.crdt_ops,
+                                    MAX_STREAM_CHUNK_BYTES,
+                                ) {
+                                    let msg = wrap_crdt_batch(
+                                        crdt_batch,
+                                        shared_sequence.fetch_add(1, Ordering::Relaxed),
+                                        &self_name_incremental,
+                                    );
+                                    match tx_incremental.try_send(msg) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            log::debug!(
+                                                peer = %peer_name_incremental,
+                                                "crdt batch dropped on backpressure"
+                                            );
+                                            break;
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            log::warn!(
+                                                peer = %peer_name_incremental,
+                                                "crdt sender: channel closed, stopping"
+                                            );
+                                            return;
+                                        }
+                                    }
+                                }
                             }
 
                             let round_elapsed = round_start.elapsed();
@@ -585,6 +618,13 @@ impl GossipController {
                                                 &msg.peer_id,
                                                 batch.entries,
                                             );
+                                        }
+                                    }
+                                }
+                                StreamMessageType::CrdtBatch => {
+                                    if let Some(mesh_kv) = &mesh_kv {
+                                        if let Some(StreamPayload::CrdtBatch(batch)) = msg.payload {
+                                            dispatch_crdt_batch(mesh_kv, batch);
                                         }
                                     }
                                 }
