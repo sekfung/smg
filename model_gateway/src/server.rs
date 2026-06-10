@@ -1258,6 +1258,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         debug!("Started WorkerMonitor event loop");
     }
 
+    // Background-mode driver (claim-tick + sweeper over the background
+    // repository) is intentionally NOT started here in BGM-PR-06. The only
+    // BackgroundWorker that exists yet is the placeholder
+    // UnavailableBackgroundWorker, which finalizes every claimed job as `failed`;
+    // spawning the driver with it would regress #1614's durable `queued`
+    // contract into immediate failure for every gateway with a background
+    // repository (including the default history_backend=memory). So
+    // `background=true` requests keep returning `queued` until BGM-PR-07 (#1221)
+    // wires `BackgroundDriver::spawn(...)` with the real worker. See
+    // `routers::common::background` for the driver + its tests.
+
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
         app_context.rate_limiter.clone(),
         config.router_config.queue_size,
