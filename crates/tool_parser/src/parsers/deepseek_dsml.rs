@@ -520,6 +520,22 @@ impl ToolParser for DeepSeekDsmlParser {
             }
         }
 
+        // Handle the outer block close tag (`</｜DSML｜{block_name}>`).
+        //
+        // The Python reference parser (`parse_tool_calls` in encoding_dsv4.py)
+        // treats this token as a termination condition: when encountered, it
+        // exits the tool-call parsing loop. Without this step the close tag
+        // remains in the buffer indefinitely — it satisfies `has_dsml` (the
+        // `</…>` form still contains `<dsml_token>` as a substring) but never
+        // matches `invoke_regex`, so the buffer never advances.
+        //
+        // Any text after the close tag (which shouldn't exist under the DSML
+        // template but can appear with non-conformant engines) stays in the
+        // buffer and will be emitted as normal text on the next call.
+        if let Some(close_pos) = self.buffer.find(self.block_close.as_str()) {
+            self.buffer = self.buffer[close_pos + self.block_close.len()..].to_string();
+        }
+
         Ok(StreamingParseResult {
             normal_text: String::new(),
             calls: all_calls,

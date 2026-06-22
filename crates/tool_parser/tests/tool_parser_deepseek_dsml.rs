@@ -792,3 +792,183 @@ async fn test_deepseek_dsml_v4_streaming_split_outer_close_after_multiple_tools_
         "split outer close marker must not leak as normal_text, got: {normal_text:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests: outer block close tag consumption
+//
+// After all invoke blocks are processed, the outer `</｜DSML｜{block_name}>`
+// close tag must be consumed from the buffer and must never leak into output.
+// Without this, text arriving after the close tag is trapped behind the
+// unprocessed tag and is never emitted.
+// ---------------------------------------------------------------------------
+
+/// When the outer block close tag is the only thing left in the buffer,
+/// the parser must consume it and return empty normal_text (no leak).
+#[tokio::test]
+async fn test_deepseek_dsml_v4_outer_close_consumed_after_all_invokes() {
+    let tools = create_test_tools();
+    let mut parser = DeepSeekDsmlParser::v4();
+
+    // Simulate a complete streaming sequence: open → invoke → close
+    let chunks = [
+        "<｜DSML｜tool_calls>\n",
+        "<｜DSML｜invoke name=\"search\">\n",
+        "<｜DSML｜parameter name=\"query\" string=\"true\">test</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n",
+        "</｜DSML｜tool_calls>",
+    ];
+
+    let mut tool_names: Vec<String> = Vec::new();
+    let mut normal_text = String::new();
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        normal_text.push_str(&result.normal_text);
+        for call in result.calls {
+            if let Some(name) = call.name {
+                tool_names.push(name);
+            }
+        }
+    }
+
+    assert_eq!(tool_names, vec!["search"]);
+    // The outer close tag must never leak into normal_text
+    assert!(
+        !normal_text.contains("</｜DSML｜tool_calls>"),
+        "outer close tag leaked into normal_text: {normal_text:?}"
+    );
+    assert!(
+        !normal_text.contains("</｜DSML｜"),
+        "DSML close fragment leaked into normal_text: {normal_text:?}"
+    );
+}
+
+/// Text arriving in a separate chunk AFTER the outer block close tag must be
+/// emitted as normal text, not trapped behind the unprocessed close tag.
+#[tokio::test]
+async fn test_deepseek_dsml_v4_text_after_outer_close_emitted() {
+    let tools = create_test_tools();
+    let mut parser = DeepSeekDsmlParser::v4();
+
+    // Full tool block, then additional text in a separate chunk.
+    // (Non-conformant output — DSML template puts EOS after close — but the
+    // parser must handle it robustly.)
+    let chunks = [
+        "Before tools.\n\n",
+        "<｜DSML｜tool_calls>\n",
+        "<｜DSML｜invoke name=\"search\">\n",
+        "<｜DSML｜parameter name=\"query\" string=\"true\">test</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n",
+        "</｜DSML｜tool_calls>",
+        "\nAfter tools.",
+    ];
+
+    let mut tool_names: Vec<String> = Vec::new();
+    let mut normal_text = String::new();
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        normal_text.push_str(&result.normal_text);
+        for call in result.calls {
+            if let Some(name) = call.name {
+                tool_names.push(name);
+            }
+        }
+    }
+
+    assert_eq!(tool_names, vec!["search"]);
+    assert!(
+        normal_text.contains("Before tools."),
+        "text before tools must be emitted, got: {normal_text:?}"
+    );
+    assert!(
+        normal_text.contains("After tools."),
+        "text after close tag must be emitted, got: {normal_text:?}"
+    );
+    assert!(
+        !normal_text.contains("</｜DSML｜tool_calls>"),
+        "outer close tag must not leak into normal_text, got: {normal_text:?}"
+    );
+}
+
+/// When text after the outer close arrives in the same chunk as the close
+/// tag, the parser must consume the close tag and keep the trailing text
+/// in the buffer for the next call.
+#[tokio::test]
+async fn test_deepseek_dsml_v4_close_with_trailing_text_same_chunk() {
+    let tools = create_test_tools();
+    let mut parser = DeepSeekDsmlParser::v4();
+
+    // The close tag and trailing text arrive together.
+    let chunks = [
+        "Preamble\n",
+        "<｜DSML｜tool_calls>\n",
+        "<｜DSML｜invoke name=\"search\">\n",
+        "<｜DSML｜parameter name=\"query\" string=\"true\">test</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n",
+        // Close tag + trailing text in one chunk:
+        "</｜DSML｜tool_calls>\nTrailing text.",
+    ];
+
+    let mut tool_names: Vec<String> = Vec::new();
+    let mut normal_text = String::new();
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        normal_text.push_str(&result.normal_text);
+        for call in result.calls {
+            if let Some(name) = call.name {
+                tool_names.push(name);
+            }
+        }
+    }
+
+    assert_eq!(tool_names, vec!["search"]);
+    assert!(
+        normal_text.contains("Preamble"),
+        "preamble must be emitted, got: {normal_text:?}"
+    );
+    assert!(
+        normal_text.contains("Trailing text."),
+        "trailing text must be emitted, got: {normal_text:?}"
+    );
+    assert!(
+        !normal_text.contains("</｜DSML｜"),
+        "DSML fragments must not leak into normal_text, got: {normal_text:?}"
+    );
+}
+
+/// V3.2 variant: same outer close consumption test with `function_calls` block name.
+#[tokio::test]
+async fn test_deepseek_dsml_v32_outer_close_consumed_after_all_invokes() {
+    let tools = create_test_tools();
+    let mut parser = DeepSeekDsmlParser::v32();
+
+    let chunks = [
+        "<｜DSML｜function_calls>\n",
+        "<｜DSML｜invoke name=\"search\">\n",
+        "<｜DSML｜parameter name=\"query\" string=\"true\">test</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n",
+        "</｜DSML｜function_calls>",
+        "\nAfter tools text.",
+    ];
+
+    let mut tool_names: Vec<String> = Vec::new();
+    let mut normal_text = String::new();
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        normal_text.push_str(&result.normal_text);
+        for call in result.calls {
+            if let Some(name) = call.name {
+                tool_names.push(name);
+            }
+        }
+    }
+
+    assert_eq!(tool_names, vec!["search"]);
+    assert!(
+        normal_text.contains("After tools text."),
+        "text after V3.2 close tag must be emitted, got: {normal_text:?}"
+    );
+    assert!(
+        !normal_text.contains("</｜DSML｜function_calls>"),
+        "V3.2 close tag must not leak, got: {normal_text:?}"
+    );
+}
