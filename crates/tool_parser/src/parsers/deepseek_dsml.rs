@@ -84,6 +84,17 @@ fn strip_dsml_trailing(s: &str, closing_tag: &str) -> String {
     s.to_string()
 }
 
+fn ends_with_partial_dsml_closing_tag(s: &str, closing_tag: &str) -> bool {
+    for (idx, _) in s.char_indices() {
+        let suffix = &s[idx..];
+        if !suffix.is_empty() && suffix.len() < closing_tag.len() && closing_tag.starts_with(suffix)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 impl DeepSeekDsmlParser {
     /// Create a DeepSeek V3.2 parser (outer block token `function_calls`).
     pub fn v32() -> Self {
@@ -306,7 +317,10 @@ impl ToolParser for DeepSeekDsmlParser {
         let has_partial_prefix = current_text.ends_with('<')
             || current_text.ends_with("<｜")
             || current_text.ends_with("</")
-            || current_text.ends_with("</｜");
+            || current_text.ends_with("</｜")
+            || ends_with_partial_dsml_closing_tag(&current_text, self.block_close.as_str())
+            || ends_with_partial_dsml_closing_tag(&current_text, DSML_INVOKE_END_TAG)
+            || ends_with_partial_dsml_closing_tag(&current_text, DSML_PARAMETER_END_TAG);
 
         if !has_dsml && !has_partial_prefix {
             let mut normal_text = std::mem::take(&mut self.buffer);
@@ -317,6 +331,12 @@ impl ToolParser for DeepSeekDsmlParser {
                 EOS_TOKEN,
             ] {
                 normal_text = normal_text.replace(end_token, "");
+            }
+            normal_text = strip_dsml_trailing(&normal_text, self.block_close.as_str());
+            normal_text = strip_dsml_trailing(&normal_text, DSML_INVOKE_END_TAG);
+            normal_text = strip_dsml_trailing(&normal_text, DSML_PARAMETER_END_TAG);
+            if self.current_tool_id >= 0 && normal_text.trim().is_empty() {
+                normal_text.clear();
             }
             return Ok(StreamingParseResult {
                 normal_text,

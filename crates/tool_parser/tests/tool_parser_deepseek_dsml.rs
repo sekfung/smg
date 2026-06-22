@@ -756,3 +756,39 @@ async fn test_deepseek_dsml_v4_streaming_malformed_empty_name_does_not_trap_buff
 
     assert_eq!(tool_names, vec!["search"]);
 }
+
+#[tokio::test]
+async fn test_deepseek_dsml_v4_streaming_split_outer_close_after_multiple_tools_does_not_leak() {
+    let tools = create_test_tools();
+    let mut parser = DeepSeekDsmlParser::v4();
+
+    let chunks = [
+        "<｜DSML｜tool_calls>\n",
+        "<｜DSML｜invoke name=\"search\">\n",
+        "<｜DSML｜parameter name=\"query\" string=\"true\">rust</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n",
+        "<｜DSML｜invoke name=\"get_weather\">\n",
+        "<｜DSML｜parameter name=\"location\" string=\"true\">Tokyo</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n",
+        "</｜DSML｜",
+        "tool_calls>",
+    ];
+
+    let mut tool_names: Vec<String> = Vec::new();
+    let mut normal_text = String::new();
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        normal_text.push_str(&result.normal_text);
+        for call in result.calls {
+            if let Some(name) = call.name {
+                tool_names.push(name);
+            }
+        }
+    }
+
+    assert_eq!(tool_names, vec!["search", "get_weather"]);
+    assert!(
+        !normal_text.contains("</｜DSML｜"),
+        "split outer close marker must not leak as normal_text, got: {normal_text:?}"
+    );
+}
