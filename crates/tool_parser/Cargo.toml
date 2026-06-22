@@ -13,7 +13,7 @@ keywords = ["llm", "tool-calling", "function-calling", "parser"]
 categories = ["parsing", "api-bindings"]
 
 [dependencies]
-openai-protocol.workspace = true
+openai-protocol = { version = "1.8", features = ["axum"] }
 async-trait.workspace = true
 num-traits.workspace = true
 parking_lot = { workspace = true }
